@@ -33,5 +33,6 @@ You may refer to https://www.tensorflow.org/versions/r0.11/how_tos/reading_data/
 the final step: training DNN models:
 run in terminal as follows:
 >python DNN.py
+
 the prediction results is simply stored in thePredResults.txt
 '''
