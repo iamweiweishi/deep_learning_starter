@@ -12,11 +12,6 @@ run in terminal as follows:
 You can substitute 'Your key words' at the end of the spiderBaidu.py
 
 
-an alternative spider of the step: googleSpider
-just like the baiduSpider,
-run in terminal as follows:
->python spiderGoogle.py
-
 '''
 ###
 
