@@ -23,15 +23,6 @@ import time
 
 #-------read the training_index.txt--------#  
   
-'''
-training_index = './training_index.txt'  
-modelpath="./tmp/"  
-classnum=36  
-total_image = 6297*3  
-global_step = 0 
-max_epoch = 5000
-'''
-
 ######Global Para#
 imageSize=28
 classnum=5
