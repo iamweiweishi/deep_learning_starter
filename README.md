@@ -1,6 +1,6 @@
 
 steps: 
-prepare data set → write the index of the data set into 'csv.txt' → training DNN models
+prepare data set → write the index of the data set into 'csv4trainin.txt' (and csv4testing.txt) → training DNN models
 
 '''
 the first step: prepare data set
@@ -32,5 +32,5 @@ the final step: training DNN models:
 run in terminal as follows:
 >python DNN.py
 
-the prediction results is simply stored in thePredResults.txt
+the prediction results and training time are simply stored in thePredResults.txt
 '''
