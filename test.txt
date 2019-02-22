@@ -1,0 +1,298 @@
+"""
+
+# 原版caffe上加入Deep Compression
+
+### ./include
+
+1 拷贝
+
+include/caffe/layers/cmp_conv_layer.hpp
+
+include/caffe/layers/cudnn_cmp_conv_layer.hpp
+
+include/caffe/layers/cmp_inner_product_layer.hpp
+
+include/caffe/kmeans.hpp
+
+2 修改
+
+**include/caffe/layer.hpp**
+
+271行添加
+
+```
+virtual void ComputeBlobMask() {}
+```
+
+304左右添加
+
+```
+  //vector<int> masks_;
+  Blob<int> masks_;
+ 
+  Blob<int> indices_;
+  //vector<int> indices_;
+
+  Blob<Dtype> centroids_;
+  //vector<Dtype> centroids_;
+```
+
+**include/caffe/layers/base_conv_layer.hpp**
+
+65行添加
+
+```
+  // compress_weights should return true if we are implementing cmpconv, so
+  // that will set weights prunning and quantization
+  virtual bool compress_weights() = 0;
+ 
+  virtual void ComputeBlobMask() {}
+```
+
+79行添加
+
+```
+  /// temp variables for weight quantization.
+  Blob<Dtype> tmpDiff_;
+  Blob<int> freq_;
+```
+
+95行添加
+
+```
+  //sparse parameters
+  float sparse_ratio_;
+  int class_num_;
+  bool quantize_term_;
+```
+
+**include/caffe/layers/conv_layer.hpp**
+
+80行添加
+
+```
+  virtual inline bool compress_weights() {return false; }
+```
+
+**include/caffe/layers/deconv_layer.hpp**
+
+47行添加
+
+```
+  virtual inline bool compress_weights() {return false; }
+```
+
+### ./src
+
+1 拷贝
+
+src/caffe/layers/cmp_conv_layer.cpp
+
+src/caffe/layers/cmp_conv_layer.cu
+
+src/caffe/layers/cudnn_cmp_conv_layer.cpp
+
+src/caffe/layers/cudnn_cmp_conv_layer.cu
+
+src/caffe/layers/cmp_inner_product_layer.cpp
+
+src/caffe/layers/cmp_inner_product_layer.cu
+
+2 修改
+
+**src/caffe/proto/caffe.proto**
+
+636行添加
+
+```
+   //the sparse parameters 
+  optional float sparse_ratio = 19 [default = 0]; //the sparsity of weights prunning
+  optional int32 class_num = 20 [default = 256]; //the cluster numbers of k-means
+  optional bool quantize_term = 21 [default = false]; //whether to quantize weights
+```
+
+851行添加
+
+```
+  //the sparse parameters
+  optional float sparse_ratio = 7 [default = 0]; //the sparsity of weights prunning 
+  optional int32 class_num = 8 [default = 32]; //the cluster numbers of k-means 
+  optional bool quantize_term = 9 [default = false]; //whether to quantize weights
+```
+
+**src/caffe/layer_factory.cpp**
+
+11行添加
+
+```
+#include "caffe/layers/cmp_conv_layer.hpp"
+```
+
+22行添加
+
+```
+#include "caffe/layers/cudnn_cmp_conv_layer.hpp"
+```
+
+78行添加
+
+```
+// Get cmp convolution layer according to engine.
+
+template <typename Dtype>
+shared_ptr<Layer<Dtype> > GetCmpConvolutionLayer(
+    const LayerParameter& param) {
+  ConvolutionParameter conv_param = param.convolution_param();
+  ConvolutionParameter_Engine engine = conv_param.engine();
+#ifdef USE_CUDNN
+  bool use_dilation = false;
+  for (int i = 0; i < conv_param.dilation_size(); ++i) {
+    if (conv_param.dilation(i) > 1) {
+      use_dilation = true;
+    }
+  }
+#endif
+  if (engine == ConvolutionParameter_Engine_DEFAULT) {
+    engine = ConvolutionParameter_Engine_CAFFE;
+#ifdef USE_CUDNN
+    if (!use_dilation) {
+      engine = ConvolutionParameter_Engine_CUDNN;
+    }
+#endif
+  }
+  if (engine == ConvolutionParameter_Engine_CAFFE) {
+    return shared_ptr<Layer<Dtype> >(new CmpConvolutionLayer<Dtype>(param));
+#ifdef USE_CUDNN
+  } else if (engine == ConvolutionParameter_Engine_CUDNN) {
+    if (use_dilation) {
+      LOG(FATAL) << "CuDNN doesn't support the dilated convolution at Layer "
+                 << param.name();
+    }
+    return shared_ptr<Layer<Dtype> >(new CuDNNCmpConvolutionLayer<Dtype>(param));
+#endif
+  } else {
+    LOG(FATAL) << "Layer " << param.name() << " has unknown engine.";
+  }
+}
+
+REGISTER_LAYER_CREATOR(CmpConvolution, GetCmpConvolutionLayer);
+```
+
+**src/caffe/net.cpp**
+
+767行添加
+
+```
+    layers_[target_layer_id]->ComputeBlobMask();
+```
+
+**src/caffe/layers/base_conv_layer.cpp**
+
+182行添加
+
+```
+  if(compress_weights()) 
+  {// sparisty
+    sparse_ratio_ = this->layer_param_.convolution_param().sparse_ratio();
+    class_num_ = this->layer_param_.convolution_param().class_num();
+    quantize_term_ = this->layer_param_.convolution_param().quantize_term();
+    int count = this->blobs_[0]->count() ; 
+    vector<int> mask_shape(1, count);
+    this->masks_.Reshape(mask_shape);
+    //int* mask_data = this->masks_.mutable_cpu_data();
+    //this->masks_.resize(count);
+    //for(int i = 0; i< count; ++i)
+    //	mask_data[i] = 1;
+    caffe_set(count ,1, this->masks_.mutable_cpu_data());
+    if(quantize_term_)
+    {
+      vector<int> cen_shape(1, class_num_);
+      this->indices_.Reshape(mask_shape);
+      this->centroids_.Reshape(cen_shape);
+      this->tmpDiff_.Reshape(cen_shape);
+      this->freq_.Reshape(cen_shape);
+    }
+  }
+```
+
+# 原版caffe上加入multilabelimagedata和focalloss层
+
+multilabel image data layer相关hpp、cpp文件来自于博，分别复制到include和src文件夹底下，并在caffe.proto中添加如下：
+
+message LayerParameter中加入参数，397行左右添加
+
+```
+  optional MultilabelImageDataParameter multilabel_image_data_param = 148;
+```
+
+在message ImageDataParameter 块后面添加message MultilabelImageDataParameter，大概837左右添加
+
+```
+message MultilabelImageDataParameter {
+  // Specify the data source.
+  optional string source = 1;
+  // Specify the batch size.
+  optional uint32 batch_size = 4 [default = 1];
+  // The rand_skip variable is for the data layer to skip a few data points
+  // to avoid all asynchronous sgd clients to start at the same point. The skip
+  // point would be set as rand_skip * rand(0,1). Note that rand_skip should not
+  // be larger than the number of keys in the database.
+  optional uint32 rand_skip = 7 [default = 0];
+  // Whether or not ImageLayer should shuffle the list of files at every epoch.
+  optional bool shuffle = 8 [default = false];
+  // It will also resize images if new_height or new_width are not zero.
+  optional uint32 new_height = 9 [default = 0];
+  optional uint32 new_width = 10 [default = 0];
+  // Specify if the images are color or gray
+  optional bool is_color = 11 [default = true];
+  // DEPRECATED. See TransformationParameter. For data pre-processing, we can do
+  // simple scaling and subtracting the data mean, if provided. Note that the
+  // mean subtraction is always carried out before scaling.
+  optional float scale = 2 [default = 1];
+  optional string mean_file = 3;
+  // DEPRECATED. See TransformationParameter. Specify if we would like to randomly
+  // crop an image.
+  optional uint32 crop_size = 5 [default = 0];
+  // DEPRECATED. See TransformationParameter. Specify if we want to randomly mirror
+  // data.
+  optional bool mirror = 6 [default = false];
+  optional string root_folder = 12 [default = ""];
+}
+```
+
+focalloss层添加主要参照[链接](https://blog.csdn.net/qq_34951080/article/details/78491009)
+
+focal_loss_layer.cpp和focal_loss_layer.cu文件放入src/caffe/layers
+
+focal_loss_layer.hpp文件放入include/caffe/layers
+
+修改caffe.proto文件：
+
+message LayerParameter 中加入参数，417行左右添加
+
+```
+  optional FocalLossParameter focal_loss_param = 149;
+```
+
+加入message FocalLossParameter，1212行左右添加
+
+```
+message FocalLossParameter{
+    enum Engine{
+        DEFAULT = 0;
+        CAFFE = 1;
+        CUDNN = 2;
+    }
+    optional Engine engine = 1[default = DEFAULT];
+
+    //The axis along which to perform the softmax -- may be negative to index
+    //from the end(e.g., -1 for the last axis).
+    //Any other axes will be evaluated as independent softmaxes.
+    optional int32 axis = 2[default = 1];
+    optional float alpha = 3[default = 0.25];
+    optional float gamma = 4[default = 2.0];
+}
+```
+
+
+"""
