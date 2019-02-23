@@ -1,298 +1,762 @@
-"""
+#ifndef CAFFE_FOCAL_LOSS_LAYER_HPP_
+#define CAFFE_FOCAL_LOSS_LAYER_HPP_
 
-# 原版caffe上加入Deep Compression
+#include <vector>
 
-### ./include
+#include "caffe/blob.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/proto/caffe.pb.h"
 
-1 拷贝
+#include "caffe/layers/loss_layer.hpp"
+#include "caffe/layers/softmax_layer.hpp"
 
-include/caffe/layers/cmp_conv_layer.hpp
+namespace caffe {
 
-include/caffe/layers/cudnn_cmp_conv_layer.hpp
+/**
+ * @brief Computes the multinomial logistic loss for a one-of-many
+ *        classification task, passing real-valued predictions through a
+ *        softmax to get a probability distribution over classes.
+ *
+ * This layer should be preferred over separate
+ * SoftmaxLayer + MultinomialLogisticLossLayer
+ * as its gradient computation is more numerically stable.
+ * At test time, this layer can be replaced simply by a SoftmaxLayer.
+ *
+ * @param bottom input Blob vector (length 2)
+ *   -# @f$ (N \times C \times H \times W) @f$
+ *      the predictions @f$ x @f$, a Blob with values in
+ *      @f$ [-\infty, +\infty] @f$ indicating the predicted score for each of
+ *      the @f$ K = CHW @f$ classes. This layer maps these scores to a
+ *      probability distribution over classes using the softmax function
+ *      @f$ \hat{p}_{nk} = \exp(x_{nk}) /
+ *      \left[\sum_{k'} \exp(x_{nk'})\right] @f$ (see SoftmaxLayer).
+ *   -# @f$ (N \times 1 \times 1 \times 1) @f$
+ *      the labels @f$ l @f$, an integer-valued Blob with values
+ *      @f$ l_n \in [0, 1, 2, ..., K - 1] @f$
+ *      indicating the correct class label among the @f$ K @f$ classes
+ * @param top output Blob vector (length 1)
+ *   -# @f$ (1 \times 1 \times 1 \times 1) @f$
+ *      the computed cross-entropy classification loss: @f$ E =
+ *        \frac{-1}{N} \sum\limits_{n=1}^N \log(\hat{p}_{n,l_n})
+ *      @f$, for softmax output class probabilites @f$ \hat{p} @f$
+ */
+template <typename Dtype>
+class FocalLossLayer : public LossLayer<Dtype> {
+ public:
+   /**
+    * @param param provides LossParameter loss_param, with options:
+    *  - ignore_label (optional)
+    *    Specify a label value that should be ignored when computing the loss.
+    *  - normalize (optional, default true)
+    *    If true, the loss is normalized by the number of (nonignored) labels
+    *    present; otherwise the loss is simply summed over spatial locations.
+    */
+  explicit FocalLossLayer(const LayerParameter& param)
+      : LossLayer<Dtype>(param) {}
+  virtual void LayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+  virtual void Reshape(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
 
-include/caffe/layers/cmp_inner_product_layer.hpp
+  virtual inline const char* type() const { return "FocalLoss"; }
+  virtual inline int ExactNumTopBlobs() const { return -1; }
+  virtual inline int MinTopBlobs() const { return 1; }
+  virtual inline int MaxTopBlobs() const { return 2; }
 
-include/caffe/kmeans.hpp
+ protected:
+  virtual void Forward_cpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+  virtual void Forward_gpu(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
+  /**
+   * @brief Computes the softmax loss error gradient w.r.t. the predictions.
+   *
+   * Gradients cannot be computed with respect to the label inputs (bottom[1]),
+   * so this method ignores bottom[1] and requires !propagate_down[1], crashing
+   * if propagate_down[1] is set.
+   *
+   * @param top output Blob vector (length 1), providing the error gradient with
+   *      respect to the outputs
+   *   -# @f$ (1 \times 1 \times 1 \times 1) @f$
+   *      This Blob's diff will simply contain the loss_weight* @f$ \lambda @f$,
+   *      as @f$ \lambda @f$ is the coefficient of this layer's output
+   *      @f$\ell_i@f$ in the overall Net loss
+   *      @f$ E = \lambda_i \ell_i + \mbox{other loss terms}@f$; hence
+   *      @f$ \frac{\partial E}{\partial \ell_i} = \lambda_i @f$.
+   *      (*Assuming that this top Blob is not used as a bottom (input) by any
+   *      other layer of the Net.)
+   * @param propagate_down see Layer::Backward.
+   *      propagate_down[1] must be false as we can't compute gradients with
+   *      respect to the labels.
+   * @param bottom input Blob vector (length 2)
+   *   -# @f$ (N \times C \times H \times W) @f$
+   *      the predictions @f$ x @f$; Backward computes diff
+   *      @f$ \frac{\partial E}{\partial x} @f$
+   *   -# @f$ (N \times 1 \times 1 \times 1) @f$
+   *      the labels -- ignored as we can't compute their error gradients
+   */
+  virtual void Backward_cpu(const vector<Blob<Dtype>*>& top,
+      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
+  virtual void Backward_gpu(const vector<Blob<Dtype>*>& top,
+      const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom);
 
-2 修改
+  /// Read the normalization mode parameter and compute the normalizer based
+  /// on the blob size.  If normalization_mode is VALID, the count of valid
+  /// outputs will be read from valid_count, unless it is -1 in which case
+  /// all outputs are assumed to be valid.
+  virtual Dtype get_normalizer(
+      LossParameter_NormalizationMode normalization_mode, int valid_count);
 
-**include/caffe/layer.hpp**
+  /// The internal SoftmaxLayer used to map predictions to a distribution.
+  shared_ptr<Layer<Dtype> > softmax_layer_;
+  /// prob stores the output probability predictions from the SoftmaxLayer.
+  Blob<Dtype> prob_;
+  /// bottom vector holder used in call to the underlying SoftmaxLayer::Forward
+  vector<Blob<Dtype>*> softmax_bottom_vec_;
+  /// top vector holder used in call to the underlying SoftmaxLayer::Forward
+  vector<Blob<Dtype>*> softmax_top_vec_;
+  /// Whether to ignore instances with a certain label.
+  bool has_ignore_label_;
+  /// The label indicating that an instance should be ignored.
+  int ignore_label_;
+  /// How to normalize the output loss.
+  LossParameter_NormalizationMode normalization_;
 
-271行添加
+  int softmax_axis_, outer_num_, inner_num_;
+  float alpha_, gamma_;
+};
 
-```
-virtual void ComputeBlobMask() {}
-```
+}  // namespace caffe
 
-304左右添加
+#endif  // CAFFE_FOCAL_LOSS_LAYER_HPP_
 
-```
-  //vector<int> masks_;
-  Blob<int> masks_;
- 
-  Blob<int> indices_;
-  //vector<int> indices_;
 
-  Blob<Dtype> centroids_;
-  //vector<Dtype> centroids_;
-```
 
-**include/caffe/layers/base_conv_layer.hpp**
 
-65行添加
 
-```
-  // compress_weights should return true if we are implementing cmpconv, so
-  // that will set weights prunning and quantization
-  virtual bool compress_weights() = 0;
- 
-  virtual void ComputeBlobMask() {}
-```
 
-79行添加
 
-```
-  /// temp variables for weight quantization.
-  Blob<Dtype> tmpDiff_;
-  Blob<int> freq_;
-```
 
-95行添加
 
-```
-  //sparse parameters
-  float sparse_ratio_;
-  int class_num_;
-  bool quantize_term_;
-```
+#ifndef CAFFE_MULTILABEL_IMAGE_DATA_LAYER_HPP_
+#define CAFFE_MULTILABEL_IMAGE_DATA_LAYER_HPP_
 
-**include/caffe/layers/conv_layer.hpp**
+#include <string>
+#include <utility>
+#include <vector>
 
-80行添加
+#include "caffe/blob.hpp"
+#include "caffe/data_transformer.hpp"
+#include "caffe/internal_thread.hpp"
+#include "caffe/layer.hpp"
+#include "caffe/layers/base_data_layer.hpp"
+#include "caffe/proto/caffe.pb.h"
 
-```
-  virtual inline bool compress_weights() {return false; }
-```
+namespace caffe {
 
-**include/caffe/layers/deconv_layer.hpp**
+/**
+ * @brief Provides data to the Net from image files.
+ *
+ * TODO(dox): thorough documentation for Forward and proto params.
+ */
+template <typename Dtype>
+class MultilabelImageDataLayer : public BasePrefetchingDataLayer<Dtype> {
+ public:
+  explicit MultilabelImageDataLayer(const LayerParameter& param)
+      : BasePrefetchingDataLayer<Dtype>(param) {}
+  virtual ~MultilabelImageDataLayer();
+  virtual void DataLayerSetUp(const vector<Blob<Dtype>*>& bottom,
+      const vector<Blob<Dtype>*>& top);
 
-47行添加
+  virtual inline const char* type() const { return "MultilabelImageData"; }
+  virtual inline int ExactNumBottomBlobs() const { return 0; }
+  virtual inline int ExactNumTopBlobs() const { return 2; }
 
-```
-  virtual inline bool compress_weights() {return false; }
-```
+ protected:
+  shared_ptr<Caffe::RNG> prefetch_rng_;
+  virtual void ShuffleImages();
+  virtual void load_batch(Batch<Dtype>* batch);
 
-### ./src
+  vector<std::pair<std::string, vector<int> > > lines_;
+  int lines_id_;
+};
 
-1 拷贝
 
-src/caffe/layers/cmp_conv_layer.cpp
+}  // namespace caffe
 
-src/caffe/layers/cmp_conv_layer.cu
+#endif  // CAFFE_MULTILABEL_IMAGE_DATA_LAYER_HPP_
 
-src/caffe/layers/cudnn_cmp_conv_layer.cpp
 
-src/caffe/layers/cudnn_cmp_conv_layer.cu
 
-src/caffe/layers/cmp_inner_product_layer.cpp
 
-src/caffe/layers/cmp_inner_product_layer.cu
+#include <algorithm>
+#include <cfloat>
+#include <vector>
 
-2 修改
+#include "caffe/layers/focal_loss_layer.hpp"
+#include "caffe/util/math_functions.hpp"
 
-**src/caffe/proto/caffe.proto**
-
-636行添加
-
-```
-   //the sparse parameters 
-  optional float sparse_ratio = 19 [default = 0]; //the sparsity of weights prunning
-  optional int32 class_num = 20 [default = 256]; //the cluster numbers of k-means
-  optional bool quantize_term = 21 [default = false]; //whether to quantize weights
-```
-
-851行添加
-
-```
-  //the sparse parameters
-  optional float sparse_ratio = 7 [default = 0]; //the sparsity of weights prunning 
-  optional int32 class_num = 8 [default = 32]; //the cluster numbers of k-means 
-  optional bool quantize_term = 9 [default = false]; //whether to quantize weights
-```
-
-**src/caffe/layer_factory.cpp**
-
-11行添加
-
-```
-#include "caffe/layers/cmp_conv_layer.hpp"
-```
-
-22行添加
-
-```
-#include "caffe/layers/cudnn_cmp_conv_layer.hpp"
-```
-
-78行添加
-
-```
-// Get cmp convolution layer according to engine.
+namespace caffe {
 
 template <typename Dtype>
-shared_ptr<Layer<Dtype> > GetCmpConvolutionLayer(
-    const LayerParameter& param) {
-  ConvolutionParameter conv_param = param.convolution_param();
-  ConvolutionParameter_Engine engine = conv_param.engine();
-#ifdef USE_CUDNN
-  bool use_dilation = false;
-  for (int i = 0; i < conv_param.dilation_size(); ++i) {
-    if (conv_param.dilation(i) > 1) {
-      use_dilation = true;
-    }
+void FocalLossLayer<Dtype>::LayerSetUp(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::LayerSetUp(bottom, top);
+  LayerParameter softmax_param(this->layer_param_);
+  softmax_param.set_type("Softmax");
+  softmax_layer_ = LayerRegistry<Dtype>::CreateLayer(softmax_param);
+  softmax_bottom_vec_.clear();
+  softmax_bottom_vec_.push_back(bottom[0]);
+  softmax_top_vec_.clear();
+  softmax_top_vec_.push_back(&prob_);
+  softmax_layer_->SetUp(softmax_bottom_vec_, softmax_top_vec_);
+
+  alpha_ = this->layer_param_.focal_loss_param().alpha();
+  gamma_ = this->layer_param_.focal_loss_param().gamma();
+  has_ignore_label_ =
+    this->layer_param_.loss_param().has_ignore_label();
+  if (has_ignore_label_) {
+    ignore_label_ = this->layer_param_.loss_param().ignore_label();
   }
-#endif
-  if (engine == ConvolutionParameter_Engine_DEFAULT) {
-    engine = ConvolutionParameter_Engine_CAFFE;
-#ifdef USE_CUDNN
-    if (!use_dilation) {
-      engine = ConvolutionParameter_Engine_CUDNN;
-    }
-#endif
-  }
-  if (engine == ConvolutionParameter_Engine_CAFFE) {
-    return shared_ptr<Layer<Dtype> >(new CmpConvolutionLayer<Dtype>(param));
-#ifdef USE_CUDNN
-  } else if (engine == ConvolutionParameter_Engine_CUDNN) {
-    if (use_dilation) {
-      LOG(FATAL) << "CuDNN doesn't support the dilated convolution at Layer "
-                 << param.name();
-    }
-    return shared_ptr<Layer<Dtype> >(new CuDNNCmpConvolutionLayer<Dtype>(param));
-#endif
+  if (!this->layer_param_.loss_param().has_normalization() &&
+      this->layer_param_.loss_param().has_normalize()) {
+    normalization_ = this->layer_param_.loss_param().normalize() ?
+                     LossParameter_NormalizationMode_VALID :
+                     LossParameter_NormalizationMode_BATCH_SIZE;
   } else {
-    LOG(FATAL) << "Layer " << param.name() << " has unknown engine.";
+    normalization_ = this->layer_param_.loss_param().normalization();
   }
 }
 
-REGISTER_LAYER_CREATOR(CmpConvolution, GetCmpConvolutionLayer);
-```
+template <typename Dtype>
+void FocalLossLayer<Dtype>::Reshape(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  LossLayer<Dtype>::Reshape(bottom, top);
+  softmax_layer_->Reshape(softmax_bottom_vec_, softmax_top_vec_);
+  softmax_axis_ =
+      bottom[0]->CanonicalAxisIndex(this->layer_param_.focal_loss_param().axis());
+ 
+  outer_num_ = bottom[0]->count(0, softmax_axis_); // n
+  inner_num_ = bottom[0]->count(softmax_axis_ + 1);// h * w
+  CHECK_EQ(outer_num_ * inner_num_, bottom[1]->count())
+      << "Number of labels must match number of predictions; "
+      << "e.g., if softmax axis == 1 and prediction shape is (N, C, H, W), "
+      << "label count (number of labels) must be N*H*W, "
+      << "with integer values in {0, 1, ..., C-1}.";
+  if (top.size() >= 2) {
+    // softmax output
+    top[1]->ReshapeLike(*bottom[0]);
+  }
+}
 
-**src/caffe/net.cpp**
-
-767行添加
-
-```
-    layers_[target_layer_id]->ComputeBlobMask();
-```
-
-**src/caffe/layers/base_conv_layer.cpp**
-
-182行添加
-
-```
-  if(compress_weights()) 
-  {// sparisty
-    sparse_ratio_ = this->layer_param_.convolution_param().sparse_ratio();
-    class_num_ = this->layer_param_.convolution_param().class_num();
-    quantize_term_ = this->layer_param_.convolution_param().quantize_term();
-    int count = this->blobs_[0]->count() ; 
-    vector<int> mask_shape(1, count);
-    this->masks_.Reshape(mask_shape);
-    //int* mask_data = this->masks_.mutable_cpu_data();
-    //this->masks_.resize(count);
-    //for(int i = 0; i< count; ++i)
-    //	mask_data[i] = 1;
-    caffe_set(count ,1, this->masks_.mutable_cpu_data());
-    if(quantize_term_)
-    {
-      vector<int> cen_shape(1, class_num_);
-      this->indices_.Reshape(mask_shape);
-      this->centroids_.Reshape(cen_shape);
-      this->tmpDiff_.Reshape(cen_shape);
-      this->freq_.Reshape(cen_shape);
+template <typename Dtype>
+void FocalLossLayer<Dtype>::Forward_cpu(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  // The forward pass computes the softmax prob values.
+  softmax_layer_->Forward(softmax_bottom_vec_, softmax_top_vec_);
+  const Dtype* prob_data = prob_.cpu_data();
+  const Dtype* label = bottom[1]->cpu_data();
+  int dim = prob_.count() / outer_num_;
+  int count = 0;
+  Dtype loss = 0;
+  Dtype pt = 0;
+  for (int i = 0; i < outer_num_; ++i) {
+    for (int j = 0; j < inner_num_; j++) {
+      const int label_value = static_cast<int>(label[i * inner_num_ + j]);
+      if (has_ignore_label_ && label_value == ignore_label_) {
+        continue;
+      }
+      DCHECK_GE(label_value, 0);
+      DCHECK_LT(label_value, prob_.shape(softmax_axis_));
+      //loss -= log(std::max(prob_data[i * dim + label_value * inner_num_ + j],
+      //                     Dtype(FLT_MIN)));
+      pt = prob_data[i * dim + label_value * inner_num_ + j];
+      loss -= alpha_ * pow(1.0 - pt, gamma_) * log(std::max(pt, Dtype(FLT_MIN)));
+      ++count;
     }
   }
-```
-
-# 原版caffe上加入multilabelimagedata和focalloss层
-
-multilabel image data layer相关hpp、cpp文件来自于博，分别复制到include和src文件夹底下，并在caffe.proto中添加如下：
-
-message LayerParameter中加入参数，397行左右添加
-
-```
-  optional MultilabelImageDataParameter multilabel_image_data_param = 148;
-```
-
-在message ImageDataParameter 块后面添加message MultilabelImageDataParameter，大概837左右添加
-
-```
-message MultilabelImageDataParameter {
-  // Specify the data source.
-  optional string source = 1;
-  // Specify the batch size.
-  optional uint32 batch_size = 4 [default = 1];
-  // The rand_skip variable is for the data layer to skip a few data points
-  // to avoid all asynchronous sgd clients to start at the same point. The skip
-  // point would be set as rand_skip * rand(0,1). Note that rand_skip should not
-  // be larger than the number of keys in the database.
-  optional uint32 rand_skip = 7 [default = 0];
-  // Whether or not ImageLayer should shuffle the list of files at every epoch.
-  optional bool shuffle = 8 [default = false];
-  // It will also resize images if new_height or new_width are not zero.
-  optional uint32 new_height = 9 [default = 0];
-  optional uint32 new_width = 10 [default = 0];
-  // Specify if the images are color or gray
-  optional bool is_color = 11 [default = true];
-  // DEPRECATED. See TransformationParameter. For data pre-processing, we can do
-  // simple scaling and subtracting the data mean, if provided. Note that the
-  // mean subtraction is always carried out before scaling.
-  optional float scale = 2 [default = 1];
-  optional string mean_file = 3;
-  // DEPRECATED. See TransformationParameter. Specify if we would like to randomly
-  // crop an image.
-  optional uint32 crop_size = 5 [default = 0];
-  // DEPRECATED. See TransformationParameter. Specify if we want to randomly mirror
-  // data.
-  optional bool mirror = 6 [default = false];
-  optional string root_folder = 12 [default = ""];
+  //Dtype normalizer = LossLayer<Dtype>::GetNormalizer(
+  //    normalization_, outer_num_, inner_num_, count);
+  //top[0]->mutable_cpu_data()[0] = loss / normalizer;
+  top[0]->mutable_cpu_data()[0] = loss / get_normalizer(normalization_, count);
+  if (top.size() == 2) {
+    top[1]->ShareData(prob_);
+  }
 }
-```
 
-focalloss层添加主要参照[链接](https://blog.csdn.net/qq_34951080/article/details/78491009)
-
-focal_loss_layer.cpp和focal_loss_layer.cu文件放入src/caffe/layers
-
-focal_loss_layer.hpp文件放入include/caffe/layers
-
-修改caffe.proto文件：
-
-message LayerParameter 中加入参数，417行左右添加
-
-```
-  optional FocalLossParameter focal_loss_param = 149;
-```
-
-加入message FocalLossParameter，1212行左右添加
-
-```
-message FocalLossParameter{
-    enum Engine{
-        DEFAULT = 0;
-        CAFFE = 1;
-        CUDNN = 2;
+template <typename Dtype>
+void FocalLossLayer<Dtype>::Backward_cpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+  if (propagate_down[1]) {
+    LOG(FATAL) << this->type()
+               << " Layer cannot backpropagate to label inputs.";
+  }
+  if (propagate_down[0]) {
+    Dtype* bottom_diff = bottom[0]->mutable_cpu_diff();
+    const Dtype* prob_data = prob_.cpu_data();
+    //caffe_copy(prob_.count(), prob_data, bottom_diff);
+    const Dtype* label = bottom[1]->cpu_data();
+    int dim = prob_.count() / outer_num_;
+    int count = 0;
+    Dtype focal_diff = 0;
+    Dtype pt = 0;
+    Dtype pc = 0;
+    for (int i = 0; i < outer_num_; ++i) {
+      for (int j = 0; j < inner_num_; ++j) {
+        const int label_value = static_cast<int>(label[i * inner_num_ + j]);
+        if (has_ignore_label_ && label_value == ignore_label_) {
+          for (int c = 0; c < bottom[0]->shape(softmax_axis_); ++c) {
+            bottom_diff[i * dim + c * inner_num_ + j] = 0;
+          }
+        } else {
+          //bottom_diff[i * dim + label_value * inner_num_ + j] -= 1;
+          pt = prob_data[i * dim + label_value * inner_num_ + j];
+          for (int c = 0; c < bottom[0]->shape(softmax_axis_); ++c) {
+              pc = prob_data[i * dim + c * inner_num_ + j];
+              if(c == label_value){
+                  focal_diff =  alpha_ * 
+                      pow(1 - pt, gamma_) * (gamma_ * pt * log(std::max(pt, Dtype(FLT_MIN))) + pt - 1);
+              }
+              else{
+                  focal_diff = alpha_ * 
+                     (pow(1 - pt, gamma_ - 1) * (-gamma_ * log(std::max(pt, Dtype(FLT_MIN))) * pt * pc)
+                       + pow(1 - pt, gamma_) * pc);
+              }
+              bottom_diff[i * dim + c * inner_num_ + j] = focal_diff;
+	  }
+          ++count;
+        }
+      }
     }
-    optional Engine engine = 1[default = DEFAULT];
-
-    //The axis along which to perform the softmax -- may be negative to index
-    //from the end(e.g., -1 for the last axis).
-    //Any other axes will be evaluated as independent softmaxes.
-    optional int32 axis = 2[default = 1];
-    optional float alpha = 3[default = 0.25];
-    optional float gamma = 4[default = 2.0];
+    // Scale gradient
+    //Dtype normalizer = LossLayer<Dtype>::GetNormalizer(
+    //    normalization_, outer_num_, inner_num_, count);
+    //Dtype loss_weight = top[0]->cpu_diff()[0] / normalizer;
+    Dtype loss_weight = top[0]->cpu_diff()[0] / get_normalizer(normalization_, count);
+    caffe_scal(prob_.count(), loss_weight, bottom_diff);
+  }
 }
-```
+
+template <typename Dtype>
+Dtype FocalLossLayer<Dtype>::get_normalizer(
+    LossParameter_NormalizationMode normalization_mode, int valid_count) {
+  Dtype normalizer;
+  switch (normalization_mode) {
+    case LossParameter_NormalizationMode_FULL:
+      normalizer = Dtype(outer_num_ * inner_num_);
+      break;
+    case LossParameter_NormalizationMode_VALID:
+      if (valid_count == -1) {
+        normalizer = Dtype(outer_num_ * inner_num_);
+      } else {
+        normalizer = Dtype(valid_count);
+      }
+      break;
+    case LossParameter_NormalizationMode_BATCH_SIZE:
+      normalizer = Dtype(outer_num_);
+      break;
+    case LossParameter_NormalizationMode_NONE:
+      normalizer = Dtype(1);
+      break;
+    default:
+      LOG(FATAL) << "Unknown normalization mode: "
+          << LossParameter_NormalizationMode_Name(normalization_mode);
+  }
+  // Some users will have no labels for some examples in order to 'turn off' a
+  // particular loss in a multi-task setup. The max prevents NaNs in that case.
+  return std::max(Dtype(1.0), normalizer);
+}
+
+#ifdef CPU_ONLY
+STUB_GPU(FocalLossLayer);
+#endif
+
+INSTANTIATE_CLASS(FocalLossLayer);
+REGISTER_LAYER_CLASS(FocalLoss);
+
+}  // namespace caffe
 
 
-"""
+
+#include <algorithm>
+#include <cfloat>
+#include <vector>
+
+#include "caffe/layers/focal_loss_layer.hpp"
+#include "caffe/util/math_functions.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+__global__ void FocalLossForwardGPU(const int nthreads,
+          const Dtype* prob_data, const Dtype* label, Dtype* loss,
+          const int num, const int dim, const int spatial_dim,
+          const bool has_ignore_label_, const int ignore_label_,
+          Dtype* counts, float alpha_, float gamma_) {
+  CUDA_KERNEL_LOOP(index, nthreads) {
+    const int n = index / spatial_dim;
+    const int s = index % spatial_dim;
+    const int label_value = static_cast<int>(label[n * spatial_dim + s]);
+    if (has_ignore_label_ && label_value == ignore_label_) {
+      loss[index] = 0;
+      counts[index] = 0;
+    } else {
+      //loss[index] = -log(max(prob_data[n * dim + label_value * spatial_dim + s],
+      //                Dtype(FLT_MIN)));
+      Dtype pt = prob_data[n * dim + label_value * spatial_dim + s];
+      loss[index] = -alpha_ * powf(1 - pt, gamma_) * log(max(pt, Dtype(FLT_MIN)));
+      counts[index] = 1;
+    }
+  }
+}
+
+template <typename Dtype>
+void FocalLossLayer<Dtype>::Forward_gpu(
+    const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) {
+  softmax_layer_->Forward(softmax_bottom_vec_, softmax_top_vec_);
+  const Dtype* prob_data = prob_.gpu_data();
+  const Dtype* label = bottom[1]->gpu_data();
+  const int dim = prob_.count() / outer_num_;
+  const int nthreads = outer_num_ * inner_num_;
+  // Since this memory is not used for anything until it is overwritten
+  // on the backward pass, we use it here to avoid having to allocate new GPU
+  // memory to accumulate intermediate results in the kernel.
+  Dtype* loss_data = bottom[0]->mutable_gpu_diff();
+  // Similarly, this memory is never used elsewhere, and thus we can use it
+  // to avoid having to allocate additional GPU memory.
+  Dtype* counts = prob_.mutable_gpu_diff();
+  // NOLINT_NEXT_LINE(whitespace/operators)
+  FocalLossForwardGPU<Dtype><<<CAFFE_GET_BLOCKS(nthreads),
+      CAFFE_CUDA_NUM_THREADS>>>(nthreads, prob_data, label, loss_data,
+      outer_num_, dim, inner_num_, has_ignore_label_, ignore_label_, counts,
+      alpha_, gamma_);
+  Dtype loss;
+  caffe_gpu_asum(nthreads, loss_data, &loss);
+  Dtype valid_count = -1;
+  // Only launch another CUDA kernel if we actually need the count of valid
+  // outputs.
+  if (normalization_ == LossParameter_NormalizationMode_VALID &&
+      has_ignore_label_) {
+    caffe_gpu_asum(nthreads, counts, &valid_count);
+  }
+  //Dtype normalizer = LossLayer<Dtype>::GetNormalizer(
+  //    normalization_, outer_num_, inner_num_, valid_count);
+  //top[0]->mutable_cpu_data()[0] = loss / normalizer;
+  top[0]->mutable_cpu_data()[0] = loss / get_normalizer(normalization_, valid_count);
+  if (top.size() == 2) {
+    top[1]->ShareData(prob_);
+  }
+}
+
+template <typename Dtype>
+__global__ void FocalLossBackwardGPU(const int nthreads, const Dtype* top,
+          const Dtype* label, Dtype* bottom_diff, const int num, const int dim,
+          const int spatial_dim, const bool has_ignore_label_,
+          const int ignore_label_, Dtype* counts, float alpha_, float gamma_) {
+  const int channels = dim / spatial_dim;
+
+  CUDA_KERNEL_LOOP(index, nthreads) {
+    const int n = index / spatial_dim;
+    const int s = index % spatial_dim;
+    const int label_value = static_cast<int>(label[n * spatial_dim + s]);
+
+    if (has_ignore_label_ && label_value == ignore_label_) {
+      for (int c = 0; c < channels; ++c) {
+        bottom_diff[n * dim + c * spatial_dim + s] = 0;
+      }
+      counts[index] = 0;
+    } else {
+      Dtype pt = bottom_diff[n * dim + label_value * spatial_dim + s];
+      for (int c = 0; c < channels; ++c) {
+        if(c == label_value){
+            bottom_diff[n * dim + c * spatial_dim + s] = alpha_ *
+            powf(1 - pt, gamma_) * (gamma_ * pt * log(max(pt, Dtype(FLT_MIN))) + pt - 1);
+        }
+        else{
+            Dtype pc = bottom_diff[n * dim + c * spatial_dim + s];
+            bottom_diff[n * dim + c * spatial_dim + s] = alpha_ * 
+                (powf(1 - pt, gamma_ - 1) * (-gamma_ * log(max(pt, Dtype(FLT_MIN))) * pt * pc) +
+                powf(1 - pt, gamma_) * pc);
+        }
+      }
+      counts[index] = 1;
+    }
+  }
+}
+
+template <typename Dtype>
+void FocalLossLayer<Dtype>::Backward_gpu(const vector<Blob<Dtype>*>& top,
+    const vector<bool>& propagate_down, const vector<Blob<Dtype>*>& bottom) {
+  if (propagate_down[1]) {
+    LOG(FATAL) << this->type()
+               << " Layer cannot backpropagate to label inputs.";
+  }
+  if (propagate_down[0]) {
+    Dtype* bottom_diff = bottom[0]->mutable_gpu_diff();
+    const Dtype* prob_data = prob_.gpu_data();
+    const Dtype* top_data = top[0]->gpu_data();
+    caffe_gpu_memcpy(prob_.count() * sizeof(Dtype), prob_data, bottom_diff);
+    const Dtype* label = bottom[1]->gpu_data();
+    const int dim = prob_.count() / outer_num_;
+    const int nthreads = outer_num_ * inner_num_;
+    // Since this memory is never used for anything else,
+    // we use to to avoid allocating new GPU memory.
+    Dtype* counts = prob_.mutable_gpu_diff();
+    // NOLINT_NEXT_LINE(whitespace/operators)
+    FocalLossBackwardGPU<Dtype><<<CAFFE_GET_BLOCKS(nthreads),
+        CAFFE_CUDA_NUM_THREADS>>>(nthreads, top_data, label, bottom_diff,
+        outer_num_, dim, inner_num_, has_ignore_label_, ignore_label_, counts,
+        alpha_, gamma_);
+
+    Dtype valid_count = -1;
+    // Only launch another CUDA kernel if we actually need the count of valid
+    // outputs.
+    if (normalization_ == LossParameter_NormalizationMode_VALID &&
+        has_ignore_label_) {
+      caffe_gpu_asum(nthreads, counts, &valid_count);
+    }
+    //Dtype normalizer = LossLayer<Dtype>::GetNormalizer(
+    //    normalization_, outer_num_, inner_num_, valid_count);
+    //const Dtype loss_weight = top[0]->cpu_diff()[0] / normalizer;
+    const Dtype loss_weight = top[0]->cpu_diff()[0] / get_normalizer(normalization_, valid_count);
+    caffe_gpu_scal(prob_.count(), loss_weight , bottom_diff);
+  }
+}
+
+INSTANTIATE_LAYER_GPU_FUNCS(FocalLossLayer);
+
+}  // namespace caffe
+
+
+
+
+
+
+#ifdef USE_OPENCV
+#include <opencv2/core/core.hpp>
+
+#include <fstream>  // NOLINT(readability/streams)
+#include <iostream>  // NOLINT(readability/streams)
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "caffe/data_transformer.hpp"
+#include "caffe/layers/base_data_layer.hpp"
+#include "caffe/layers/multilabel_image_data_layer.hpp"
+#include "caffe/util/benchmark.hpp"
+#include "caffe/util/io.hpp"
+#include "caffe/util/math_functions.hpp"
+#include "caffe/util/rng.hpp"
+
+namespace caffe {
+
+template <typename Dtype>
+MultilabelImageDataLayer<Dtype>::~MultilabelImageDataLayer<Dtype>() {
+  this->StopInternalThread();
+}
+
+template <typename Dtype>
+void MultilabelImageDataLayer<Dtype>::DataLayerSetUp(const vector<Blob<Dtype>*>& bottom, const vector<Blob<Dtype>*>& top) 
+{
+  const int new_height = this->layer_param_.multilabel_image_data_param().new_height();
+  const int new_width  = this->layer_param_.multilabel_image_data_param().new_width();
+  const bool is_color  = this->layer_param_.multilabel_image_data_param().is_color();
+  string root_folder = this->layer_param_.multilabel_image_data_param().root_folder();
+
+  CHECK((new_height == 0 && new_width == 0) ||
+      (new_height > 0 && new_width > 0)) << "Current implementation requires "
+      "new_height and new_width to be set at the same time.";
+  // Read the file with filenames and labels
+  const string& source = this->layer_param_.multilabel_image_data_param().source();
+  LOG(INFO) << "Opening file " << source;
+  
+  //std::ifstream infile(source.c_str());
+  //string line;
+  //size_t pos;
+  //int label;
+  //while (std::getline(infile, line)) {
+  //  pos = line.find_last_of(' ');
+  //  label = atoi(line.substr(pos + 1).c_str());
+  //  lines_.push_back(std::make_pair(line.substr(0, pos), label));
+  //}
+  std::ifstream infile(source.c_str());
+  string line;
+  string fileName;
+  int numLabel = 0;
+  int ccLine = 0;
+  while ( std::getline(infile,line) )
+  {
+	  vector<int> labelList;
+	  int label;
+	  
+	  std::istringstream iss(line);
+	  iss >> fileName;
+	  while( iss >> label )
+	  {
+		  labelList.push_back( label );
+	  }
+	  ccLine += 1;
+	  
+	  if (ccLine == 1)
+	  {
+		  numLabel = labelList.size();
+	  }
+	  else
+	  {
+		  CHECK_EQ(numLabel, labelList.size()) << fileName << "-----------" << "all images must have equel labels" << std::endl;
+	  }
+	  
+	  lines_.push_back( std::make_pair( fileName, labelList ) );
+  }
+  CHECK(!lines_.empty()) << "File is empty";
+
+  if (this->layer_param_.multilabel_image_data_param().shuffle()) {
+    // randomly shuffle data
+    LOG(INFO) << "Shuffling data";
+    const unsigned int prefetch_rng_seed = caffe_rng_rand();
+    prefetch_rng_.reset(new Caffe::RNG(prefetch_rng_seed));
+    ShuffleImages();
+  } else {
+    if (this->phase_ == TRAIN && Caffe::solver_rank() > 0 &&
+        this->layer_param_.multilabel_image_data_param().rand_skip() == 0) {
+      LOG(WARNING) << "Shuffling or skipping recommended for multi-GPU";
+    }
+  }
+  LOG(INFO) << "A total of " << lines_.size() << " images.";
+
+  lines_id_ = 0;
+  // Check if we would need to randomly skip a few data points
+  if (this->layer_param_.multilabel_image_data_param().rand_skip()) {
+    unsigned int skip = caffe_rng_rand() %
+        this->layer_param_.multilabel_image_data_param().rand_skip();
+    LOG(INFO) << "Skipping first " << skip << " data points.";
+    CHECK_GT(lines_.size(), skip) << "Not enough points to skip";
+    lines_id_ = skip;
+  }
+  // Read an image, and use it to initialize the top blob.
+  cv::Mat cv_img = ReadImageToCVMat(root_folder + lines_[lines_id_].first,
+                                    new_height, new_width, is_color);
+  CHECK(cv_img.data) << "Could not load " << lines_[lines_id_].first;
+  // Use data_transformer to infer the expected blob shape from a cv_image.
+  vector<int> top_shape = this->data_transformer_->InferBlobShape(cv_img);
+  this->transformed_data_.Reshape(top_shape);
+  // Reshape prefetch_data and top[0] according to the batch_size.
+  const int batch_size = this->layer_param_.multilabel_image_data_param().batch_size();
+  CHECK_GT(batch_size, 0) << "Positive batch size required";
+  top_shape[0] = batch_size;
+  for (int i = 0; i < this->prefetch_.size(); ++i) {
+    this->prefetch_[i]->data_.Reshape(top_shape);
+  }
+  top[0]->Reshape(top_shape);
+
+  LOG(INFO) << "output data size: " << top[0]->num() << ","
+      << top[0]->channels() << "," << top[0]->height() << ","
+      << top[0]->width();
+	  
+  // label  
+  //vector<int> label_shape(1, batch_size);
+  //top[1]->Reshape(label_shape);
+  //for (int i = 0; i < this->prefetch_.size(); ++i) {
+  //  this->prefetch_[i]->label_.Reshape(label_shape);
+  //}
+  vector<int> label_shape(2);
+  label_shape[0] = batch_size;
+  label_shape[1] = numLabel;
+  top[1]->Reshape(label_shape);
+  for(int i = 0; i < this->prefetch_.size(); ++i)
+  {
+	  this->prefetch_[i]->label_.Reshape(label_shape);
+  }
+}
+
+template <typename Dtype>
+void MultilabelImageDataLayer<Dtype>::ShuffleImages() {
+  caffe::rng_t* prefetch_rng =
+      static_cast<caffe::rng_t*>(prefetch_rng_->generator());
+  shuffle(lines_.begin(), lines_.end(), prefetch_rng);
+}
+
+// This function is called on prefetch thread
+template <typename Dtype>
+void MultilabelImageDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) 
+{  
+  CPUTimer batch_timer;
+  batch_timer.Start();
+  double read_time = 0;
+  double trans_time = 0;
+  CPUTimer timer;
+  CHECK(batch->data_.count());
+  CHECK(this->transformed_data_.count());
+  MultilabelImageDataParameter multilabel_image_data_param = this->layer_param_.multilabel_image_data_param();
+  const int batch_size = multilabel_image_data_param.batch_size();
+  const int new_height = multilabel_image_data_param.new_height();
+  const int new_width = multilabel_image_data_param.new_width();
+  const bool is_color = multilabel_image_data_param.is_color();
+  string root_folder = multilabel_image_data_param.root_folder();
+
+  // Reshape according to the first image of each batch
+  // on single input batches allows for inputs of varying dimension.
+  cv::Mat cv_img = ReadImageToCVMat(root_folder + lines_[lines_id_].first, new_height, new_width, is_color);
+  CHECK(cv_img.data) << "Could not load " << lines_[lines_id_].first;
+  // Use data_transformer to infer the expected blob shape from a cv_img.
+  vector<int> top_shape = this->data_transformer_->InferBlobShape(cv_img);
+  this->transformed_data_.Reshape(top_shape);
+  // Reshape batch according to the batch_size.
+  top_shape[0] = batch_size;
+  batch->data_.Reshape(top_shape);
+
+  Dtype* prefetch_data = batch->data_.mutable_cpu_data();
+  Dtype* prefetch_label = batch->label_.mutable_cpu_data();
+
+  // datum scales
+  const int lines_size = lines_.size();
+  for (int item_id = 0; item_id < batch_size; ++item_id) {
+    // get a blob
+    timer.Start();
+    CHECK_GT(lines_size, lines_id_);
+    cv::Mat cv_img = ReadImageToCVMat(root_folder + lines_[lines_id_].first, new_height, new_width, is_color);
+    CHECK(cv_img.data) << "Could not load " << lines_[lines_id_].first;
+    read_time += timer.MicroSeconds();
+    timer.Start();
+    // Apply transformations (mirror, crop...) to the image
+    int offset = batch->data_.offset(item_id);
+    this->transformed_data_.set_cpu_data(prefetch_data + offset);
+    this->data_transformer_->Transform(cv_img, &(this->transformed_data_));
+    trans_time += timer.MicroSeconds();
+    
+    //prefetch_label[item_id] = lines_[lines_id_].second;
+	int numLabel = lines_[lines_id_].second.size();
+	for (int i = 0; i < numLabel; i++)
+	{
+		prefetch_label[item_id*numLabel+i] = lines_[lines_id_].second[i];
+	}
+    
+    // go to the next iter
+    lines_id_++;
+    if (lines_id_ >= lines_size) {
+      // We have reached the end. Restart from the first.
+      DLOG(INFO) << "Restarting data prefetching from start.";
+      lines_id_ = 0;
+      if (this->layer_param_.multilabel_image_data_param().shuffle()) {
+        ShuffleImages();
+      }
+    }
+  }
+  batch_timer.Stop();
+  DLOG(INFO) << "Prefetch batch: " << batch_timer.MilliSeconds() << " ms.";
+  DLOG(INFO) << "     Read time: " << read_time / 1000 << " ms.";
+  DLOG(INFO) << "Transform time: " << trans_time / 1000 << " ms.";
+}
+
+INSTANTIATE_CLASS(MultilabelImageDataLayer);
+REGISTER_LAYER_CLASS(MultilabelImageData);
+
+}  // namespace caffe
+#endif  // USE_OPENCV
+
+
+
+
+
+
